@@ -1,0 +1,94 @@
+(page "index.html"
+  (:require [alandipert.storage-atom :refer [local-storage]]
+            [datascript.core :as d]
+            [javelin.core :refer [with-let]]))
+
+#_(.clear js/localStorage)
+
+(def conn (local-storage (d/create-conn) :conn))
+(def db   (with-let [c (cell @conn)]
+            (add-watch conn (gensym) #(reset! c %4))))
+
+(def root-id 0)
+
+(defc= num-nodes
+  (-> (d/q '[:find (count ?id) :where [?id :node/rank _]] db)
+      ffirst
+      (or 0)))
+
+(defn next-rank [db parent-id]
+  (-> (d/q '[:find (max ?rank)
+             :in $ ?parent-id
+             :where
+             [?id :node/parent ?parent-id]
+             [?id :node/rank ?rank]]
+        db
+        parent-id)
+      ffirst
+      (or 0)
+      inc))
+
+(defn children [db parent-id]
+  (->> (d/q '[:find ?id ?rank ?title
+              :in $ ?parent-id
+              :where
+              [?id :node/parent ?parent-id]
+              [?id :node/rank ?rank]
+              [?id :node/title ?title]]
+         db
+         parent-id)
+       (map #(zipmap [:id :rank :title] %))
+       (sort-by :rank #(compare %2 %1))))
+
+(defn add! [parent-id title]
+  (d/transact! conn [{:db/id -1
+                      :node/parent parent-id
+                      :node/title title
+                      :node/rank (next-rank @db parent-id)}]))
+
+(defn descendents [db parent-id]
+  (->> (d/q '[:find ?id
+              :in $ % ?parent-id
+              :where (child ?id ?parent-id)]
+         db
+         '[[(child ?e1 ?e2)
+            [?e1 :node/parent ?e2]]
+           [(child ?e1 ?e2)
+            [?e1 :node/parent ?t]
+            (child ?t ?e2)]]
+         parent-id)
+       (map first)
+       set))
+
+(defn delete! [ids]
+  (let [tx (map #(vector :db.fn/retractEntity %) ids)]
+    (d/transact! conn tx)))
+
+(defn node [ref]
+  (cell-let [{:keys [id rank title]} ref]
+    (li :id (cell= (str "node-" id))
+      (p
+        (interpose " "
+          [(span (text "~{rank}."))
+           title
+           (button :click #(delete! (conj (descendents @db @id) @id)) "Delete")
+           (button :click #(add! @id (str (gensym "title"))) "Add")]))
+      (ul
+        (loop-tpl :bindings [kid (cell= (children db id))]
+          (node kid))))))
+
+(html
+  (head
+    (title "Tree"))
+  (body
+    (p (em (text "Number of nodes: ~{num-nodes}")))
+    (button
+      :disabled (cell= (zero? num-nodes))
+      :click #(delete! (descendents @db 0))
+      "Clear")
+    (button :click #(add! root-id (str (gensym "node"))) "Add")
+    (ul
+      (loop-tpl :bindings [kid (cell= (children db root-id))]
+        (node kid)))))
+
+
